@@ -31,7 +31,11 @@ from sam3.model.sam3_image_processor import Sam3Processor
 
 @dataclass
 class WorkerConfig:
-    process_every_n: int = 10
+    # Run SAM3 on every Nth frame; lower = more responsive, higher = less GPU load.
+    process_every_n: int = 2
+    # Maximum resolution used for SAM3 inference (longer image side).
+    # The GUI will still display full-resolution frames; masks are resized.
+    max_infer_resolution: int = 720
     default_prompt: str = "person"
 
 
@@ -74,6 +78,8 @@ def sam3_worker(frame_q: mp.Queue, result_q: mp.Queue, prompt_q: mp.Queue, confi
         device = "cuda" if torch.cuda.is_available() else "cpu"
         if device == "cuda":
             torch.cuda.set_device(0)
+            # Let cuDNN pick the fastest algorithms for this GPU / input size.
+            torch.backends.cudnn.benchmark = True
         model = build_sam3_image_model(enable_segmentation=True, device=device)
         processor = Sam3Processor(model, device=device)
         print("[Worker] SAM3 model loaded on", device)
@@ -105,7 +111,20 @@ def sam3_worker(frame_q: mp.Queue, result_q: mp.Queue, prompt_q: mp.Queue, confi
             continue
 
         try:
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # Optionally downscale for faster inference while keeping display full-res.
+            frame_for_infer = frame
+            if config.max_infer_resolution is not None:
+                h, w = frame.shape[:2]
+                longer_side = max(h, w)
+                if longer_side > config.max_infer_resolution:
+                    scale = config.max_infer_resolution / float(longer_side)
+                    new_w = int(w * scale)
+                    new_h = int(h * scale)
+                    frame_for_infer = cv2.resize(
+                        frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR
+                    )
+
+            frame_rgb = cv2.cvtColor(frame_for_infer, cv2.COLOR_BGR2RGB)
             pil_image = Image.fromarray(frame_rgb)
 
             inference_state = processor.set_image(pil_image)
