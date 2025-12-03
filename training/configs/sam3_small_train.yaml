@@ -8,7 +8,7 @@ defaults:
 paths:
   dataset_root: /home/vkwk/cursor/linux setup/sam3-project/data/aquarium
   experiment_log_dir: /home/vkwk/cursor/linux setup/sam3-project/experiments/sam3_small_aquarium
-  bpe_path: /home/vkwk/cursor/linux setup/sam3-project/sam3/sam3/assets/bpe_simple_vocab_16e6.txt.gz
+  bpe_path: /home/vkwk/cursor/linux setup/sam3-project/sam3/assets/bpe_simple_vocab_16e6.txt.gz
 
 # ============================================================================
 # Dataset Configuration  
@@ -109,13 +109,13 @@ scratch:
   # Training parameters for consumer GPU
   train_batch_size: 2        # Increase if you have more VRAM
   val_batch_size: 1
-  gradient_accumulation_steps: 4  # Effective batch = 2*4 = 8
+  gradient_accumulation_steps: 1  # Effective batch = 2*4 = 8
   num_train_workers: 4
   num_val_workers: 2
   max_ann_per_img: 100       # Max objects per image
 
   # Learning rate (scaled down for smaller model)
-  lr_scale: 0.05             # 5% of original LR
+  lr_scale: 0.005             # 05% of original LR
   lr_transformer: ${times:8e-4,${scratch.lr_scale}}
   lr_vision_backbone: ${times:2.5e-4,${scratch.lr_scale}}
   lr_language_backbone: ${times:5e-5,${scratch.lr_scale}}
@@ -124,7 +124,7 @@ scratch:
 
   # Scheduler
   scheduler_timescale: 20
-  scheduler_warmup: 50       # More warmup for stability
+  scheduler_warmup: 200       # More warmup for stability
   scheduler_cooldown: 20
 
   # Matcher
@@ -269,7 +269,7 @@ trainer:
 
   optim:
     amp:
-      enabled: true
+      enabled: false
       amp_dtype: float16  # Use float16 for consumer GPUs
 
     optimizer:
@@ -349,4 +349,5 @@ launcher:
   multiprocessing_context: spawn
 
 submitit:
-  use_cluster: false         # Local training (not SLURM)
+  use_cluster: false
+  port_range: [10000, 65000]
