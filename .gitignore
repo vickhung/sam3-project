@@ -11,3 +11,10 @@ __pycache__/
 .DS_Store
 
 data/
+experiments/
+
+# Model checkpoints and weights
+*.pt
+*.pth
+*.onnx
+*.engine
