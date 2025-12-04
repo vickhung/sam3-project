@@ -320,204 +320,439 @@ def project_weight_svd(large_weight: torch.Tensor, target_shape: tuple) -> torch
     return projected.to(large_weight.dtype)
 
 
-def load_vit_weights_with_svd(model: nn.Module, config, checkpoint_path: str = None) -> None:
+def load_vit_weights_direct(model: nn.Module, config, checkpoint_path: str = None) -> None:
     """
-    Load pretrained ViT weights from SAM3, projecting dimensions with SVD.
+    Load pretrained ViT weights from SAM3 with direct layer transfer.
     
+    NEW APPROACH: Same dimensions, just skip layers!
     SAM3 ViT: 1024 dim, 32 layers, 16 heads
-    Our ViT:  768 dim, 16 layers, 12 heads
+    Our ViT:  1024 dim, 12 layers, 16 heads  (SAME dims!)
     
     Strategy:
-    1. Layer skipping: Take every 2nd layer (0, 2, 4, ... 30) 
-    2. SVD projection: Project 1024 → 768 dimensions
-    3. Head reduction: Take first 12 of 16 heads
+    1. Direct copy of patch embed, pos embed (same dimensions)
+    2. Layer skipping: Select evenly-spaced layers from 32 → 12
+       e.g., layers [0, 2, 5, 8, 10, 13, 16, 18, 21, 24, 26, 29]
+    3. No projection needed - weights copy directly!
     """
+    if checkpoint_path is None:
+        checkpoint_path = download_sam3_checkpoint()
+    
+    print("Loading pretrained ViT weights with DIRECT layer transfer...")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    
+    if "model" in checkpoint:
+        state_dict = checkpoint["model"]
+    else:
+        state_dict = checkpoint
+    
+    # Remove "detector." prefix from checkpoint keys
+    state_dict = {k.replace("detector.", ""): v for k, v in state_dict.items()}
+    
+    our_state = model.state_dict()
+    
+    LARGE_DEPTH = 32
+    SMALL_DEPTH = config.vit_depth
+    
+    # Calculate which layers to take (evenly spaced)
+    # For 12 layers from 32: [0, 2, 5, 8, 10, 13, 16, 18, 21, 24, 26, 29]
+    layer_indices = [int(i * (LARGE_DEPTH - 1) / (SMALL_DEPTH - 1)) for i in range(SMALL_DEPTH)]
+    print(f"  Layer mapping: taking layers {layer_indices} from original 32")
+    
+    loaded = 0
+    
+    # 1. Patch embedding - DIRECT COPY (same dimensions!)
+    for suffix in [".weight", ".bias"]:
+        key = f"backbone.vision_backbone.trunk.patch_embed.proj{suffix}"
+        if key in state_dict and key in our_state:
+            if state_dict[key].shape == our_state[key].shape:
+                our_state[key] = state_dict[key].clone()
+                loaded += 1
+                print(f"  ✓ Direct copy: patch_embed{suffix} {state_dict[key].shape}")
+    
+    # 2. Position embedding - DIRECT COPY (same dimensions!)
+    pos_key = "backbone.vision_backbone.trunk.pos_embed"
+    if pos_key in state_dict and pos_key in our_state:
+        large_pos = state_dict[pos_key]
+        target_shape = our_state[pos_key].shape
+        if large_pos.shape == target_shape:
+            our_state[pos_key] = large_pos.clone()
+            loaded += 1
+            print(f"  ✓ Direct copy: pos_embed {large_pos.shape}")
+        else:
+            # Same dimension but different number of positions - tile/interpolate
+            print(f"  ✓ Position embed: {large_pos.shape} → {target_shape} (tiling)")
+            our_state[pos_key] = large_pos  # ViT handles interpolation internally
+            loaded += 1
+    
+    # 3. Pre-LayerNorm - DIRECT COPY
+    for param in ["weight", "bias"]:
+        key = f"backbone.vision_backbone.trunk.ln_pre.{param}"
+        if key in state_dict and key in our_state:
+            our_state[key] = state_dict[key].clone()
+            loaded += 1
+    
+    # 4. Transformer blocks with layer selection
+    print(f"  Transferring {SMALL_DEPTH} layers from original {LARGE_DEPTH}...")
+    
+    for small_idx, large_idx in enumerate(layer_indices):
+        block_prefix_large = f"backbone.vision_backbone.trunk.blocks.{large_idx}"
+        block_prefix_small = f"backbone.vision_backbone.trunk.blocks.{small_idx}"
+        
+        # Copy all parameters from selected layer
+        for key in state_dict.keys():
+            if key.startswith(block_prefix_large + "."):
+                # Replace the layer index
+                new_key = key.replace(block_prefix_large, block_prefix_small)
+                if new_key in our_state:
+                    if state_dict[key].shape == our_state[new_key].shape:
+                        our_state[new_key] = state_dict[key].clone()
+                        loaded += 1
+    
+    # Load the weights
+    model.load_state_dict(our_state, strict=False)
+    
+    print(f"  ✓ Loaded {loaded} ViT parameters via DIRECT transfer")
+    print(f"  ✓ Layer selection: {SMALL_DEPTH} from {LARGE_DEPTH} (no projection!)")
+    print(f"  ✓ Dimensions preserved: 1024 embed, 16 heads, 4736 MLP")
+
+
+def load_vit_weights_with_svd(model: nn.Module, config, checkpoint_path: str = None) -> None:
+    """
+    LEGACY: Load pretrained ViT weights with SVD projection.
+    Use load_vit_weights_direct() for same-dimension configs!
+    """
+    # Check if we can use direct transfer (same dimensions)
+    if config.vit_embed_dim == 1024 and config.vit_num_heads == 16:
+        print("  (Using direct transfer - dimensions match!)")
+        return load_vit_weights_direct(model, config, checkpoint_path)
+    
+    # Otherwise fall back to SVD projection for dimension reduction
     if checkpoint_path is None:
         checkpoint_path = download_sam3_checkpoint()
     
     print("Loading pretrained ViT weights with SVD projection...")
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     
-    # Get the state dict
     if "model" in checkpoint:
         state_dict = checkpoint["model"]
     else:
         state_dict = checkpoint
     
-    # Our model's state dict
     our_state = model.state_dict()
     
-    # Configuration
     LARGE_DIM = 1024
-    SMALL_DIM = config.vit_embed_dim  # 768
+    SMALL_DIM = config.vit_embed_dim
     LARGE_DEPTH = 32
-    SMALL_DEPTH = config.vit_depth  # 16
-    LARGE_HEADS = 16
-    SMALL_HEADS = config.vit_num_heads  # 12
+    SMALL_DEPTH = config.vit_depth
     
-    # Layer mapping: our layer i → SAM3 layer i*2
-    layer_stride = LARGE_DEPTH // SMALL_DEPTH  # 32/16 = 2
+    layer_indices = [int(i * (LARGE_DEPTH - 1) / (SMALL_DEPTH - 1)) for i in range(SMALL_DEPTH)]
     
     loaded = 0
-    skipped = 0
     
-    # 1. Patch embedding: [1024, 3, 14, 14] → [768, 3, 14, 14]
+    # Patch embedding with SVD
     patch_key = "backbone.vision_backbone.trunk.patch_embed.proj.weight"
     if patch_key in state_dict and patch_key in our_state:
-        large_w = state_dict[patch_key]  # [1024, 3, 14, 14]
-        target_shape = our_state[patch_key].shape  # [768, 3, 14, 14]
-        # Reshape, project, reshape back
-        large_flat = large_w.view(LARGE_DIM, -1)  # [1024, 588]
+        large_w = state_dict[patch_key]
+        target_shape = our_state[patch_key].shape
+        large_flat = large_w.view(LARGE_DIM, -1)
         target_flat = (SMALL_DIM, large_flat.shape[1])
         projected = project_weight_svd(large_flat, target_flat)
         our_state[patch_key] = projected.view(target_shape)
         loaded += 1
-        print(f"  ✓ Projected patch_embed: {large_w.shape} → {target_shape}")
     
-    # Patch embed bias
-    patch_bias_key = "backbone.vision_backbone.trunk.patch_embed.proj.bias"
-    if patch_bias_key in state_dict and patch_bias_key in our_state:
-        our_state[patch_bias_key] = state_dict[patch_bias_key][:SMALL_DIM]
-        loaded += 1
-    
-    # 2. Position embedding: [1, N, 1024] → [1, N', 768]
+    # Position embedding with SVD
     pos_key = "backbone.vision_backbone.trunk.pos_embed"
     if pos_key in state_dict and pos_key in our_state:
-        large_pos = state_dict[pos_key]  # [1, 577, 1024] for 336x336/14
-        target_shape = our_state[pos_key].shape  # [1, 324, 768] for 252x252/14
-        
-        # Project each position's embedding
-        large_2d = large_pos.squeeze(0)  # [577, 1024]
-        target_2d = (target_shape[1], target_shape[2])  # [324, 768]
-        
-        # Take first N positions and project dimension
-        n_pos = min(large_2d.shape[0], target_2d[0])
-        projected_pos = project_weight_svd(large_2d[:n_pos, :], (n_pos, SMALL_DIM))
-        
-        # If we need more positions, interpolate or pad
-        if n_pos < target_2d[0]:
-            # Pad with learned initialization (zeros work for now)
-            result = torch.zeros(target_2d)
-            result[:n_pos, :] = projected_pos
+        large_pos = state_dict[pos_key].squeeze(0)
+        target_shape = our_state[pos_key].shape
+        n_pos = min(large_pos.shape[0], target_shape[1])
+        projected_pos = project_weight_svd(large_pos[:n_pos], (n_pos, SMALL_DIM))
+        if n_pos < target_shape[1]:
+            result = torch.zeros((target_shape[1], SMALL_DIM))
+            result[:n_pos] = projected_pos
             projected_pos = result
-        
         our_state[pos_key] = projected_pos.unsqueeze(0)
         loaded += 1
-        print(f"  ✓ Projected pos_embed: {large_pos.shape} → {target_shape}")
     
-    # 3. Transformer blocks with layer skipping
-    print(f"  Transferring {SMALL_DEPTH} layers (skipping every {layer_stride}nd from {LARGE_DEPTH})...")
-    
-    for small_idx in range(SMALL_DEPTH):
-        large_idx = small_idx * layer_stride  # 0→0, 1→2, 2→4, etc.
+    # Blocks with layer selection and SVD
+    for small_idx, large_idx in enumerate(layer_indices):
+        block_large = f"backbone.vision_backbone.trunk.blocks.{large_idx}"
+        block_small = f"backbone.vision_backbone.trunk.blocks.{small_idx}"
         
-        block_prefix_large = f"backbone.vision_backbone.trunk.blocks.{large_idx}"
-        block_prefix_small = f"backbone.vision_backbone.trunk.blocks.{small_idx}"
-        
-        # QKV projection: [3*1024, 1024] → [3*768, 768]
-        qkv_key = f"{block_prefix_small}.attn.qkv.weight"
-        qkv_key_large = f"{block_prefix_large}.attn.qkv.weight"
+        # QKV
+        qkv_key = f"{block_small}.attn.qkv.weight"
+        qkv_key_large = f"{block_large}.attn.qkv.weight"
         if qkv_key_large in state_dict and qkv_key in our_state:
-            large_qkv = state_dict[qkv_key_large]  # [3072, 1024]
-            target_shape = our_state[qkv_key].shape  # [2304, 768]
-            projected = project_weight_svd(large_qkv, target_shape)
-            our_state[qkv_key] = projected
+            our_state[qkv_key] = project_weight_svd(
+                state_dict[qkv_key_large], our_state[qkv_key].shape
+            )
             loaded += 1
         
-        # QKV bias
-        qkv_bias_key = f"{block_prefix_small}.attn.qkv.bias"
-        qkv_bias_key_large = f"{block_prefix_large}.attn.qkv.bias"
-        if qkv_bias_key_large in state_dict and qkv_bias_key in our_state:
-            large_bias = state_dict[qkv_bias_key_large]  # [3072]
-            target_size = our_state[qkv_bias_key].shape[0]  # 2304
-            our_state[qkv_bias_key] = large_bias[:target_size]
-            loaded += 1
-        
-        # Attention output projection: [1024, 1024] → [768, 768]
-        proj_key = f"{block_prefix_small}.attn.proj.weight"
-        proj_key_large = f"{block_prefix_large}.attn.proj.weight"
+        # Proj
+        proj_key = f"{block_small}.attn.proj.weight"
+        proj_key_large = f"{block_large}.attn.proj.weight"
         if proj_key_large in state_dict and proj_key in our_state:
-            large_proj = state_dict[proj_key_large]
-            target_shape = our_state[proj_key].shape
-            projected = project_weight_svd(large_proj, target_shape)
-            our_state[proj_key] = projected
+            our_state[proj_key] = project_weight_svd(
+                state_dict[proj_key_large], our_state[proj_key].shape
+            )
             loaded += 1
         
-        proj_bias_key = f"{block_prefix_small}.attn.proj.bias"
-        proj_bias_key_large = f"{block_prefix_large}.attn.proj.bias"
-        if proj_bias_key_large in state_dict and proj_bias_key in our_state:
-            our_state[proj_bias_key] = state_dict[proj_bias_key_large][:SMALL_DIM]
-            loaded += 1
+        # MLP
+        for fc in ["fc1", "fc2"]:
+            fc_key = f"{block_small}.mlp.{fc}.weight"
+            fc_key_large = f"{block_large}.mlp.{fc}.weight"
+            if fc_key_large in state_dict and fc_key in our_state:
+                our_state[fc_key] = project_weight_svd(
+                    state_dict[fc_key_large], our_state[fc_key].shape
+                )
+                loaded += 1
         
-        # MLP fc1: [4096, 1024] → [3072, 768] (mlp_ratio * dim)
-        fc1_key = f"{block_prefix_small}.mlp.fc1.weight"
-        fc1_key_large = f"{block_prefix_large}.mlp.fc1.weight"
-        if fc1_key_large in state_dict and fc1_key in our_state:
-            large_fc1 = state_dict[fc1_key_large]
-            target_shape = our_state[fc1_key].shape
-            projected = project_weight_svd(large_fc1, target_shape)
-            our_state[fc1_key] = projected
-            loaded += 1
+        # Biases and norms - truncate
+        for suffix in [".attn.qkv.bias", ".attn.proj.bias", 
+                      ".mlp.fc1.bias", ".mlp.fc2.bias",
+                      ".norm1.weight", ".norm1.bias",
+                      ".norm2.weight", ".norm2.bias"]:
+            key = block_small + suffix
+            key_large = block_large + suffix
+            if key_large in state_dict and key in our_state:
+                target_size = our_state[key].shape[0]
+                our_state[key] = state_dict[key_large][:target_size]
+                loaded += 1
+    
+    model.load_state_dict(our_state, strict=False)
+    print(f"  ✓ Loaded {loaded} ViT parameters via SVD projection")
+
+
+def load_detector_weights(model: nn.Module, config, checkpoint_path: str = None) -> None:
+    """
+    Load transformer, geometry encoder, segmentation head, and dot product scoring weights.
+    These use d_model=256 which we keep the same, so direct copy works.
+    
+    For encoder/decoder layers, we use layer selection similar to ViT.
+    """
+    if checkpoint_path is None:
+        checkpoint_path = download_sam3_checkpoint()
+    
+    print("Loading detector component weights...")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    
+    if "model" in checkpoint:
+        state_dict = checkpoint["model"]
+    else:
+        state_dict = checkpoint
+    
+    # Remove "detector." prefix
+    state_dict = {k.replace("detector.", ""): v for k, v in state_dict.items()}
+    
+    our_state = model.state_dict()
+    loaded = 0
+    
+    # Layer mapping for encoder (6 -> 4 layers)
+    LARGE_ENC_LAYERS = 6
+    SMALL_ENC_LAYERS = config.encoder_layers
+    enc_indices = [int(i * (LARGE_ENC_LAYERS - 1) / (SMALL_ENC_LAYERS - 1)) for i in range(SMALL_ENC_LAYERS)]
+    
+    # Layer mapping for decoder (6 -> 4 layers)
+    LARGE_DEC_LAYERS = 6
+    SMALL_DEC_LAYERS = config.decoder_layers
+    dec_indices = [int(i * (LARGE_DEC_LAYERS - 1) / (SMALL_DEC_LAYERS - 1)) for i in range(SMALL_DEC_LAYERS)]
+    
+    print(f"  Encoder layers: {enc_indices} from original 6")
+    print(f"  Decoder layers: {dec_indices} from original 6")
+    
+    # 1. Transformer encoder with layer selection
+    for small_idx, large_idx in enumerate(enc_indices):
+        prefix_large = f"transformer.encoder.layers.{large_idx}"
+        prefix_small = f"transformer.encoder.layers.{small_idx}"
         
-        fc1_bias_key = f"{block_prefix_small}.mlp.fc1.bias"
-        fc1_bias_key_large = f"{block_prefix_large}.mlp.fc1.bias"
-        if fc1_bias_key_large in state_dict and fc1_bias_key in our_state:
-            large_bias = state_dict[fc1_bias_key_large]
-            target_size = our_state[fc1_bias_key].shape[0]
-            our_state[fc1_bias_key] = large_bias[:target_size]
-            loaded += 1
-        
-        # MLP fc2: [1024, 4096] → [768, 3072]
-        fc2_key = f"{block_prefix_small}.mlp.fc2.weight"
-        fc2_key_large = f"{block_prefix_large}.mlp.fc2.weight"
-        if fc2_key_large in state_dict and fc2_key in our_state:
-            large_fc2 = state_dict[fc2_key_large]
-            target_shape = our_state[fc2_key].shape
-            projected = project_weight_svd(large_fc2, target_shape)
-            our_state[fc2_key] = projected
-            loaded += 1
-        
-        fc2_bias_key = f"{block_prefix_small}.mlp.fc2.bias"
-        fc2_bias_key_large = f"{block_prefix_large}.mlp.fc2.bias"
-        if fc2_bias_key_large in state_dict and fc2_bias_key in our_state:
-            our_state[fc2_bias_key] = state_dict[fc2_bias_key_large][:SMALL_DIM]
-            loaded += 1
-        
-        # LayerNorms: [1024] → [768]
-        for norm_name in ["norm1", "norm2"]:
-            for param in ["weight", "bias"]:
-                key = f"{block_prefix_small}.{norm_name}.{param}"
-                key_large = f"{block_prefix_large}.{norm_name}.{param}"
-                if key_large in state_dict and key in our_state:
-                    our_state[key] = state_dict[key_large][:SMALL_DIM]
+        for key in list(state_dict.keys()):
+            if key.startswith(prefix_large + "."):
+                new_key = key.replace(prefix_large, prefix_small)
+                if new_key in our_state and state_dict[key].shape == our_state[new_key].shape:
+                    our_state[new_key] = state_dict[key].clone()
                     loaded += 1
     
-    # 4. Final layer norm
-    for param in ["weight", "bias"]:
-        key = f"backbone.vision_backbone.trunk.ln_pre.{param}"
-        if key in state_dict and key in our_state:
-            our_state[key] = state_dict[key][:SMALL_DIM]
+    # 2. Transformer decoder with layer selection
+    for small_idx, large_idx in enumerate(dec_indices):
+        prefix_large = f"transformer.decoder.layers.{large_idx}"
+        prefix_small = f"transformer.decoder.layers.{small_idx}"
+        
+        for key in list(state_dict.keys()):
+            if key.startswith(prefix_large + "."):
+                new_key = key.replace(prefix_large, prefix_small)
+                if new_key in our_state and state_dict[key].shape == our_state[new_key].shape:
+                    our_state[new_key] = state_dict[key].clone()
+                    loaded += 1
+    
+    # 3. Other transformer components (non-layer-indexed)
+    # Handle query embeddings specially - take first N queries
+    for key in state_dict.keys():
+        if key.startswith("transformer.") and ".layers." not in key:
+            if key in our_state:
+                src_shape = state_dict[key].shape
+                dst_shape = our_state[key].shape
+                
+                if src_shape == dst_shape:
+                    our_state[key] = state_dict[key].clone()
+                    loaded += 1
+                elif "query_embed" in key or "reference_points" in key:
+                    # Take first N queries (200 -> 100)
+                    n_queries = dst_shape[0]
+                    our_state[key] = state_dict[key][:n_queries].clone()
+                    loaded += 1
+                    print(f"  Query truncated: {key} {src_shape} -> {dst_shape}")
+    
+    # 4. Geometry encoder with layer selection (3 -> 2 layers)
+    LARGE_GEO_LAYERS = 3
+    SMALL_GEO_LAYERS = config.geo_encoder_layers
+    geo_indices = [int(i * (LARGE_GEO_LAYERS - 1) / (SMALL_GEO_LAYERS - 1)) for i in range(SMALL_GEO_LAYERS)]
+    print(f"  Geo encoder layers: {geo_indices} from original 3")
+    
+    for small_idx, large_idx in enumerate(geo_indices):
+        prefix_large = f"geometry_encoder.layers.{large_idx}"
+        prefix_small = f"geometry_encoder.layers.{small_idx}"
+        
+        for key in list(state_dict.keys()):
+            if key.startswith(prefix_large + "."):
+                new_key = key.replace(prefix_large, prefix_small)
+                if new_key in our_state and state_dict[key].shape == our_state[new_key].shape:
+                    our_state[new_key] = state_dict[key].clone()
+                    loaded += 1
+    
+    # Non-layer geometry encoder components
+    for key in state_dict.keys():
+        if key.startswith("geometry_encoder.") and ".layers." not in key:
+            if key in our_state and state_dict[key].shape == our_state[key].shape:
+                our_state[key] = state_dict[key].clone()
+                loaded += 1
+    
+    # 5. Segmentation head - direct copy
+    for key in state_dict.keys():
+        if key.startswith("segmentation_head."):
+            if key in our_state and state_dict[key].shape == our_state[key].shape:
+                our_state[key] = state_dict[key].clone()
+                loaded += 1
+    
+    # 6. Dot product scoring - direct copy
+    for key in state_dict.keys():
+        if key.startswith("dot_prod_scoring."):
+            if key in our_state and state_dict[key].shape == our_state[key].shape:
+                our_state[key] = state_dict[key].clone()
+                loaded += 1
+    
+    model.load_state_dict(our_state, strict=False)
+    print(f"  ✓ Loaded {loaded} detector parameters")
+
+
+def load_text_encoder_weights_direct(model: nn.Module, config, checkpoint_path: str = None) -> None:
+    """
+    Load pretrained text encoder weights from SAM3 with direct layer transfer.
+    
+    NEW APPROACH: Same dimensions, just skip layers!
+    SAM3 Text: 1024 dim, 24 layers, 16 heads
+    Our Text:  1024 dim, 12 layers, 16 heads  (SAME dims!)
+    
+    Strategy:
+    1. Direct copy of token/position embeddings (same dimensions)
+    2. Layer skipping: Select evenly-spaced layers from 24 → 12
+    3. No projection needed!
+    """
+    if checkpoint_path is None:
+        checkpoint_path = download_sam3_checkpoint()
+    
+    print("Loading pretrained text encoder weights with DIRECT layer transfer...")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    
+    if "model" in checkpoint:
+        state_dict = checkpoint["model"]
+    else:
+        state_dict = checkpoint
+    
+    # Remove "detector." prefix from checkpoint keys
+    state_dict = {k.replace("detector.", ""): v for k, v in state_dict.items()}
+    
+    our_state = model.state_dict()
+    
+    LARGE_LAYERS = 24
+    SMALL_LAYERS = config.text_layers
+    
+    # Calculate which layers to take (evenly spaced)
+    layer_indices = [int(i * (LARGE_LAYERS - 1) / (SMALL_LAYERS - 1)) for i in range(SMALL_LAYERS)]
+    print(f"  Layer mapping: taking layers {layer_indices} from original 24")
+    
+    loaded = 0
+    
+    # 1. Token embedding - DIRECT COPY
+    token_key = "backbone.language_backbone.encoder.token_embedding.weight"
+    if token_key in state_dict and token_key in our_state:
+        if state_dict[token_key].shape == our_state[token_key].shape:
+            our_state[token_key] = state_dict[token_key].clone()
+            loaded += 1
+            print(f"  ✓ Direct copy: token_embedding {state_dict[token_key].shape}")
+    
+    # 2. Positional embedding - handle context length difference
+    pos_key = "backbone.language_backbone.encoder.positional_embedding"
+    if pos_key in state_dict and pos_key in our_state:
+        large_pos = state_dict[pos_key]  # [77, 1024]
+        target_shape = our_state[pos_key].shape  # [77, 1024] or similar
+        if large_pos.shape == target_shape:
+            our_state[pos_key] = large_pos.clone()
+            loaded += 1
+            print(f"  ✓ Direct copy: positional_embedding {large_pos.shape}")
+        else:
+            # Take first N positions
+            n_pos = min(large_pos.shape[0], target_shape[0])
+            our_state[pos_key] = large_pos[:n_pos].clone()
+            loaded += 1
+            print(f"  ✓ Positional embedding: {large_pos.shape} → {target_shape} (truncated)")
+    
+    # 3. Text projection - DIRECT COPY
+    proj_key = "backbone.language_backbone.encoder.text_projection"
+    if proj_key in state_dict and proj_key in our_state:
+        if state_dict[proj_key].shape == our_state[proj_key].shape:
+            our_state[proj_key] = state_dict[proj_key].clone()
             loaded += 1
     
-    # Load the projected weights
+    # 4. Final layer norm - DIRECT COPY
+    for param in ["weight", "bias"]:
+        key = f"backbone.language_backbone.encoder.ln_final.{param}"
+        if key in state_dict and key in our_state:
+            if state_dict[key].shape == our_state[key].shape:
+                our_state[key] = state_dict[key].clone()
+                loaded += 1
+    
+    # 5. Transformer blocks with layer selection
+    print(f"  Transferring {SMALL_LAYERS} layers from original {LARGE_LAYERS}...")
+    
+    for small_idx, large_idx in enumerate(layer_indices):
+        prefix_large = f"backbone.language_backbone.encoder.transformer.resblocks.{large_idx}"
+        prefix_small = f"backbone.language_backbone.encoder.transformer.resblocks.{small_idx}"
+        
+        # Copy all parameters from selected layer
+        for key in state_dict.keys():
+            if key.startswith(prefix_large + "."):
+                new_key = key.replace(prefix_large, prefix_small)
+                if new_key in our_state:
+                    if state_dict[key].shape == our_state[new_key].shape:
+                        our_state[new_key] = state_dict[key].clone()
+                        loaded += 1
+    
     model.load_state_dict(our_state, strict=False)
     
-    print(f"  ✓ Loaded {loaded} ViT parameters via SVD projection")
-    print(f"  ✓ Layer mapping: every {layer_stride}th layer from SAM3")
-    print(f"  ✓ Dimension projection: {LARGE_DIM} → {SMALL_DIM}")
+    print(f"  ✓ Loaded {loaded} text encoder parameters via DIRECT transfer")
+    print(f"  ✓ Layer selection: {SMALL_LAYERS} from {LARGE_LAYERS}")
 
 
 def load_text_encoder_weights_with_svd(model: nn.Module, config, checkpoint_path: str = None) -> None:
     """
-    Load pretrained text encoder weights from SAM3, projecting dimensions with SVD.
-    
-    SAM3 Text Encoder: 1024 dim, 24 layers, 16 heads
-    Our Text Encoder:  512 dim, 12 layers, 8 heads
-    
-    Strategy:
-    1. Layer skipping: Take every 2nd layer (0, 2, 4, ... 22)
-    2. SVD projection: Project 1024 → 512 dimensions
+    Load pretrained text encoder weights - uses direct transfer if dimensions match.
     """
+    # Check if we can use direct transfer (same dimensions)
+    if config.text_width == 1024 and config.text_heads == 16:
+        print("  (Using direct transfer - dimensions match!)")
+        return load_text_encoder_weights_direct(model, config, checkpoint_path)
+    
+    # Otherwise fall back to SVD projection
     if checkpoint_path is None:
         checkpoint_path = download_sam3_checkpoint()
     
@@ -531,33 +766,28 @@ def load_text_encoder_weights_with_svd(model: nn.Module, config, checkpoint_path
     
     our_state = model.state_dict()
     
-    # Configuration
     LARGE_DIM = 1024
-    SMALL_DIM = config.text_width  # 512
+    SMALL_DIM = config.text_width
     LARGE_LAYERS = 24
-    SMALL_LAYERS = config.text_layers  # 12
+    SMALL_LAYERS = config.text_layers
     
-    layer_stride = LARGE_LAYERS // SMALL_LAYERS  # 24/12 = 2
+    layer_indices = [int(i * (LARGE_LAYERS - 1) / (SMALL_LAYERS - 1)) for i in range(SMALL_LAYERS)]
     
     loaded = 0
     
-    # 1. Token embedding: [vocab_size, 1024] → [vocab_size, 512]
+    # Token embedding with SVD
     token_key = "backbone.language_backbone.encoder.token_embedding.weight"
     if token_key in state_dict and token_key in our_state:
-        large_emb = state_dict[token_key]  # [49408, 1024]
-        target_shape = our_state[token_key].shape  # [49408, 512]
-        # Project each token's embedding
-        projected = project_weight_svd(large_emb, target_shape)
-        our_state[token_key] = projected
+        our_state[token_key] = project_weight_svd(
+            state_dict[token_key], our_state[token_key].shape
+        )
         loaded += 1
-        print(f"  ✓ Projected token_embedding: {large_emb.shape} → {target_shape}")
     
-    # 2. Positional embedding: [context_length, 1024] → [context_length, 512]
+    # Position embedding with SVD
     pos_key = "backbone.language_backbone.encoder.positional_embedding"
     if pos_key in state_dict and pos_key in our_state:
-        large_pos = state_dict[pos_key]  # [77, 1024]
-        target_shape = our_state[pos_key].shape  # [32, 512]
-        # Take first N positions and project
+        large_pos = state_dict[pos_key]
+        target_shape = our_state[pos_key].shape
         n_pos = min(large_pos.shape[0], target_shape[0])
         projected = project_weight_svd(large_pos[:n_pos], (n_pos, SMALL_DIM))
         if n_pos < target_shape[0]:
@@ -566,104 +796,36 @@ def load_text_encoder_weights_with_svd(model: nn.Module, config, checkpoint_path
             projected = result
         our_state[pos_key] = projected
         loaded += 1
-        print(f"  ✓ Projected positional_embedding: {large_pos.shape} → {target_shape}")
     
-    # 3. Text projection: [1024, 1024] → [512, 512] (or may not exist in our model)
-    proj_key = "backbone.language_backbone.encoder.text_projection"
-    if proj_key in state_dict and proj_key in our_state:
-        large_proj = state_dict[proj_key]
-        target_shape = our_state[proj_key].shape
-        projected = project_weight_svd(large_proj, target_shape)
-        our_state[proj_key] = projected
-        loaded += 1
-    
-    # 4. Transformer blocks with layer skipping
-    print(f"  Transferring {SMALL_LAYERS} layers (skipping every {layer_stride}nd from {LARGE_LAYERS})...")
-    
-    for small_idx in range(SMALL_LAYERS):
-        large_idx = small_idx * layer_stride
-        
+    # Blocks with layer selection and SVD
+    for small_idx, large_idx in enumerate(layer_indices):
         prefix_large = f"backbone.language_backbone.encoder.transformer.resblocks.{large_idx}"
         prefix_small = f"backbone.language_backbone.encoder.transformer.resblocks.{small_idx}"
         
-        # Attention in_proj (QKV combined): [3*1024, 1024] → [3*512, 512]
-        in_proj_key = f"{prefix_small}.attn.in_proj_weight"
-        in_proj_key_large = f"{prefix_large}.attn.in_proj_weight"
-        if in_proj_key_large in state_dict and in_proj_key in our_state:
-            large_w = state_dict[in_proj_key_large]  # [3072, 1024]
-            target_shape = our_state[in_proj_key].shape  # [1536, 512]
-            projected = project_weight_svd(large_w, target_shape)
-            our_state[in_proj_key] = projected
-            loaded += 1
+        # Attention weights
+        for suffix in [".attn.in_proj_weight", ".attn.out_proj.weight",
+                      ".mlp.c_fc.weight", ".mlp.c_proj.weight"]:
+            key = prefix_small + suffix
+            key_large = prefix_large + suffix
+            if key_large in state_dict and key in our_state:
+                our_state[key] = project_weight_svd(
+                    state_dict[key_large], our_state[key].shape
+                )
+                loaded += 1
         
-        in_proj_bias_key = f"{prefix_small}.attn.in_proj_bias"
-        in_proj_bias_key_large = f"{prefix_large}.attn.in_proj_bias"
-        if in_proj_bias_key_large in state_dict and in_proj_bias_key in our_state:
-            large_b = state_dict[in_proj_bias_key_large]
-            target_size = our_state[in_proj_bias_key].shape[0]
-            our_state[in_proj_bias_key] = large_b[:target_size]
-            loaded += 1
-        
-        # Attention out_proj: [1024, 1024] → [512, 512]
-        out_proj_key = f"{prefix_small}.attn.out_proj.weight"
-        out_proj_key_large = f"{prefix_large}.attn.out_proj.weight"
-        if out_proj_key_large in state_dict and out_proj_key in our_state:
-            large_w = state_dict[out_proj_key_large]
-            target_shape = our_state[out_proj_key].shape
-            projected = project_weight_svd(large_w, target_shape)
-            our_state[out_proj_key] = projected
-            loaded += 1
-        
-        out_proj_bias_key = f"{prefix_small}.attn.out_proj.bias"
-        out_proj_bias_key_large = f"{prefix_large}.attn.out_proj.bias"
-        if out_proj_bias_key_large in state_dict and out_proj_bias_key in our_state:
-            our_state[out_proj_bias_key] = state_dict[out_proj_bias_key_large][:SMALL_DIM]
-            loaded += 1
-        
-        # MLP c_fc (first layer): [4096, 1024] → [2048, 512]
-        c_fc_key = f"{prefix_small}.mlp.c_fc.weight"
-        c_fc_key_large = f"{prefix_large}.mlp.c_fc.weight"
-        if c_fc_key_large in state_dict and c_fc_key in our_state:
-            large_w = state_dict[c_fc_key_large]
-            target_shape = our_state[c_fc_key].shape
-            projected = project_weight_svd(large_w, target_shape)
-            our_state[c_fc_key] = projected
-            loaded += 1
-        
-        c_fc_bias_key = f"{prefix_small}.mlp.c_fc.bias"
-        c_fc_bias_key_large = f"{prefix_large}.mlp.c_fc.bias"
-        if c_fc_bias_key_large in state_dict and c_fc_bias_key in our_state:
-            large_b = state_dict[c_fc_bias_key_large]
-            target_size = our_state[c_fc_bias_key].shape[0]
-            our_state[c_fc_bias_key] = large_b[:target_size]
-            loaded += 1
-        
-        # MLP c_proj (second layer): [1024, 4096] → [512, 2048]
-        c_proj_key = f"{prefix_small}.mlp.c_proj.weight"
-        c_proj_key_large = f"{prefix_large}.mlp.c_proj.weight"
-        if c_proj_key_large in state_dict and c_proj_key in our_state:
-            large_w = state_dict[c_proj_key_large]
-            target_shape = our_state[c_proj_key].shape
-            projected = project_weight_svd(large_w, target_shape)
-            our_state[c_proj_key] = projected
-            loaded += 1
-        
-        c_proj_bias_key = f"{prefix_small}.mlp.c_proj.bias"
-        c_proj_bias_key_large = f"{prefix_large}.mlp.c_proj.bias"
-        if c_proj_bias_key_large in state_dict and c_proj_bias_key in our_state:
-            our_state[c_proj_bias_key] = state_dict[c_proj_bias_key_large][:SMALL_DIM]
-            loaded += 1
-        
-        # LayerNorms
-        for ln_name in ["ln_1", "ln_2"]:
-            for param in ["weight", "bias"]:
-                key = f"{prefix_small}.{ln_name}.{param}"
-                key_large = f"{prefix_large}.{ln_name}.{param}"
-                if key_large in state_dict and key in our_state:
-                    our_state[key] = state_dict[key_large][:SMALL_DIM]
-                    loaded += 1
+        # Biases and norms - truncate
+        for suffix in [".attn.in_proj_bias", ".attn.out_proj.bias",
+                      ".mlp.c_fc.bias", ".mlp.c_proj.bias",
+                      ".ln_1.weight", ".ln_1.bias",
+                      ".ln_2.weight", ".ln_2.bias"]:
+            key = prefix_small + suffix
+            key_large = prefix_large + suffix
+            if key_large in state_dict and key in our_state:
+                target_size = our_state[key].shape[0]
+                our_state[key] = state_dict[key_large][:target_size]
+                loaded += 1
     
-    # 5. Final layer norm
+    # Final layer norm
     for param in ["weight", "bias"]:
         key = f"backbone.language_backbone.encoder.ln_final.{param}"
         if key in state_dict and key in our_state:
@@ -685,46 +847,52 @@ class SAM3SmallConfig:
     
     This dataclass holds ALL hyperparameters that define the model architecture.
     Changing these values changes the model size and behavior.
+    
+    NEW APPROACH: Keep full resolution, reduce layers only!
+    - Same image size (1008) for quality detection
+    - Same embedding dimension (1024) for direct weight transfer  
+    - Fewer layers (12 instead of 32) for speed
+    - No SVD projection needed - just skip layers!
     """
     
-    # Image Processing
-    img_size: int = 252          # Input resolution (must be divisible by patch_size)
+    # Image Processing - KEEP ORIGINAL RESOLUTION
+    img_size: int = 1008         # SAME as original for full quality
     patch_size: int = 14         # Size of each patch (14x14 pixels)
-    pretrain_img_size: int = 224 # Used for position embedding initialization
+    pretrain_img_size: int = 336 # Match original pretrain size
     
-    # Vision Backbone (ViT) - ~40% of total parameters
-    vit_embed_dim: int = 768     # Hidden dimension (original: 1024)
-    vit_depth: int = 16          # Number of transformer layers (original: 32)
-    vit_num_heads: int = 12      # Attention heads (original: 16)
-    vit_mlp_ratio: float = 4.0   # MLP hidden = embed_dim * mlp_ratio
-    vit_window_size: int = 18    # Window attention size
+    # Vision Backbone (ViT) - REDUCED LAYERS ONLY
+    vit_embed_dim: int = 1024    # SAME as original (direct weight transfer!)
+    vit_depth: int = 16          # REDUCED: 16 layers (original: 32) - 50% reduction
+    vit_num_heads: int = 16      # SAME as original (64 dim per head)
+    vit_mlp_ratio: float = 4.625 # SAME as original
+    vit_window_size: int = 24    # SAME as original
     
-    # Text Encoder - ~30% of total parameters
-    text_width: int = 512        # Hidden dimension (original: 1024)
-    text_heads: int = 8          # Attention heads (original: 16)
-    text_layers: int = 12        # Number of layers (original: 24)
-    text_context_length: int = 32
+    # Text Encoder - Keep same for compatibility
+    text_width: int = 1024       # SAME as original (direct weight transfer!)
+    text_heads: int = 16         # SAME as original
+    text_layers: int = 16        # REDUCED: 16 layers (original: 24) - 67% retained
+    text_context_length: int = 32  # Match checkpoint (SAM3 uses 32, not 77)
     
-    # Transformer Encoder/Decoder - ~20% of parameters
-    d_model: int = 256           # Model dimension (keep same as original)
-    encoder_layers: int = 4      # Fusion encoder layers (original: 6)
-    decoder_layers: int = 4      # Object decoder layers (original: 6)
-    num_queries: int = 100       # Object queries (original: 200)
-    num_heads: int = 8           # Attention heads
-    dim_feedforward: int = 1024  # FFN hidden dim (original: 2048)
+    # Transformer Encoder/Decoder - Keep MORE layers for better detection
+    d_model: int = 256           # SAME as original
+    encoder_layers: int = 6      # SAME as original
+    decoder_layers: int = 6      # SAME as original  
+    num_queries: int = 100       # Reduced queries (original: 200)
+    num_heads: int = 8           # SAME as original
+    dim_feedforward: int = 2048  # SAME as original
     
-    # Geometry Encoder - ~5% of parameters
-    geo_encoder_layers: int = 2  # Layers for encoding boxes/points (original: 3)
+    # Geometry Encoder
+    geo_encoder_layers: int = 3  # SAME as original (small, keep all)
     
     @property
     def feature_map_size(self) -> int:
         """Number of patches along each dimension."""
-        return self.img_size // self.patch_size
+        return self.img_size // self.patch_size  # 1008/14 = 72
     
     @property
     def num_patches(self) -> int:
         """Total number of image patches."""
-        return self.feature_map_size ** 2
+        return self.feature_map_size ** 2  # 72*72 = 5184
     
     def __post_init__(self):
         """Validate configuration after initialization."""
@@ -739,6 +907,22 @@ class SAM3SmallConfig:
 
 # Default configuration instance
 SAM3_SMALL_CONFIG = SAM3SmallConfig()
+
+
+@dataclass  
+class SAM3TinyConfig(SAM3SmallConfig):
+    """
+    Even smaller variant - for very constrained environments.
+    8 ViT layers, 8 text layers.
+    """
+    vit_depth: int = 8
+    text_layers: int = 8
+    encoder_layers: int = 3
+    decoder_layers: int = 3
+    num_queries: int = 50
+
+
+SAM3_TINY_CONFIG = SAM3TinyConfig()
 
 
 # =============================================================================
@@ -1119,8 +1303,9 @@ def build_sam3_small(
         print()
         print("Initializing weights for training from scratch...")
         initialize_weights(model)
-        load_text_encoder_weights_with_svd(model, config)  # Load pretrained text encoder with SVD
-        load_vit_weights_with_svd(model,config)  # Load pretrained ViT with SVD
+        load_text_encoder_weights_with_svd(model, config)  # Load pretrained text encoder
+        load_vit_weights_with_svd(model, config)  # Load pretrained ViT
+        load_detector_weights(model, config)  # Load transformer, geometry encoder, etc.
     
     # Count and report parameters
     param_info = count_parameters(model)
@@ -1165,9 +1350,9 @@ def build_sam3_small(
     print("SAM3-Small model built successfully!")
     print("=" * 60)
     
-    # Add NaN detection for debugging training from scratch
-    print("\nAdding NaN detection hooks for debugging...")
-    add_nan_hooks(model)
+    # Note: NaN hooks disabled by default - uncomment for debugging
+    # print("\nAdding NaN detection hooks for debugging...")
+    # add_nan_hooks(model)
     
     return model
 

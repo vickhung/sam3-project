@@ -3,22 +3,30 @@ defaults:
   - _self_
 
 # ============================================================================
-# Paths - UPDATED FOR AQUARIUM DATASET
+# SAM3-Small V2 Training on COCO
+# 
+# Architecture: 16 ViT layers, 16 Text layers, full 1008 resolution
+# Dataset: COCO val2017 (5K images, 80 categories)
+# ============================================================================
+
+# ============================================================================
+# Paths
 # ============================================================================
 paths:
-  dataset_root: /home/vkwk/cursor/linux setup/sam3-project/data/aquarium
-  experiment_log_dir: /home/vkwk/cursor/linux setup/sam3-project/experiments/sam3_small_aquarium
+  dataset_root: /home/vkwk/cursor/linux setup/sam3-project/data/coco
+  experiment_log_dir: /home/vkwk/cursor/linux setup/sam3-project/experiments/sam3_small_coco
   bpe_path: /home/vkwk/cursor/linux setup/sam3-project/sam3/assets/bpe_simple_vocab_16e6.txt.gz
 
 # ============================================================================
 # Dataset Configuration  
 # ============================================================================
 dataset:
-  # Roboflow format: images directly in folder, annotations as _annotations.coco.json
-  train_img_folder: ${paths.dataset_root}/train
-  train_ann_file: ${paths.dataset_root}/train/_annotations.coco.json
-  val_img_folder: ${paths.dataset_root}/valid
-  val_ann_file: ${paths.dataset_root}/valid/_annotations.coco.json
+  # COCO val2017 for training (5K images) - using val as train for quick iteration
+  train_img_folder: ${paths.dataset_root}/val2017
+  train_ann_file: ${paths.dataset_root}/annotations/instances_val2017.json
+  # Use same for validation (we'll split manually if needed)
+  val_img_folder: ${paths.dataset_root}/val2017
+  val_ann_file: ${paths.dataset_root}/annotations/instances_val2017.json
 
   # Training transforms
   train_transforms:
@@ -29,7 +37,7 @@ dataset:
           sizes:
             _target_: sam3.train.transforms.basic.get_random_resize_scales
             size: ${scratch.resolution}
-            min_size: 200
+            min_size: 400
             rounded: false
           max_size:
             _target_: sam3.train.transforms.basic.get_random_resize_max_size
@@ -86,7 +94,7 @@ dataset:
         gamma: 2
         use_presence: true
         pos_focal: false
-        pad_n_queries: 100  # Matches our num_queries
+        pad_n_queries: 100
         pad_scale_pos: 1.0
     loss_fn_semantic_seg: null
     scale_by_find_batch_size: ${scratch.scale_by_find_batch_size}
@@ -95,12 +103,10 @@ dataset:
 # Scratch (Helper Parameters)
 # ============================================================================
 scratch:
-  # SAM3-Small V2: Full resolution, reduced layers!
-  # Same 1008 resolution for best detection quality
-  # 12 ViT layers instead of 32 for reduced compute
-  resolution: 1008  # FULL resolution (same as original SAM3)
+  # SAM3-Small V2: Full resolution, 16 ViT layers
+  resolution: 1008
   d_model: 256
-  enable_segmentation: false  # Set true for mask training
+  enable_segmentation: false  # Start with detection only
 
   # Image normalization
   train_norm_mean: [0.5, 0.5, 0.5]
@@ -108,27 +114,25 @@ scratch:
   val_norm_mean: [0.5, 0.5, 0.5]
   val_norm_std: [0.5, 0.5, 0.5]
 
-  # Training parameters for consumer GPU
-  # NOTE: Full resolution requires more VRAM - adjust batch size!
-  train_batch_size: 1        # Reduced for 1008x1008 images
+  # Training parameters - optimized for 8GB GPU
+  train_batch_size: 1
   val_batch_size: 1
-  gradient_accumulation_steps: 4  # Effective batch = 1*4 = 4
+  gradient_accumulation_steps: 8  # Effective batch = 8
   num_train_workers: 4
   num_val_workers: 2
-  max_ann_per_img: 100       # Max objects per image
+  max_ann_per_img: 100
 
-  # Learning rate (scaled down for smaller model)
-  lr_scale: 0.005             # 05% of original LR
-  lr_transformer: ${times:8e-4,${scratch.lr_scale}}
-  lr_vision_backbone: ${times:2.5e-4,${scratch.lr_scale}}
-  lr_language_backbone: ${times:5e-5,${scratch.lr_scale}}
+  # Learning rate - fine-tuned for pretrained weights
+  lr_transformer: 8e-5        # 8e-4 * 0.1
+  lr_vision_backbone: 2.5e-5  # 2.5e-4 * 0.1
+  lr_language_backbone: 5e-6  # 5e-5 * 0.1
   lrd_vision_backbone: 0.9
   wd: 0.1
 
   # Scheduler
-  scheduler_timescale: 20
-  scheduler_warmup: 200       # More warmup for stability
-  scheduler_cooldown: 20
+  scheduler_timescale: 50
+  scheduler_warmup: 100
+  scheduler_cooldown: 50
 
   # Matcher
   matcher:
@@ -181,10 +185,10 @@ trainer:
   skip_saving_ckpts: false
   empty_gpu_mem_cache_after_eval: true
   skip_first_val: false
-  max_epochs: 50             # Adjust based on dataset size
+  max_epochs: 20  # Quick training run
   accelerator: cuda
   seed_value: 42
-  val_epoch_freq: 5          # Validate every 5 epochs
+  val_epoch_freq: 2
   mode: train
   gradient_accumulation_steps: ${scratch.gradient_accumulation_steps}
 
@@ -228,7 +232,7 @@ trainer:
         coco_json_loader:
           _target_: sam3.train.data.coco_json_loaders.COCO_FROM_JSON
           include_negatives: true
-          category_chunk_size: 2
+          category_chunk_size: 10
           _partial_: true
         img_folder: ${dataset.val_img_folder}
         ann_file: ${dataset.val_ann_file}
@@ -243,13 +247,11 @@ trainer:
       drop_last: false
       collate_fn: ${scratch.collate_fn_val}
 
-  # ========================================================================
-  # MODEL - Using our SAM3-Small builder
-  # ========================================================================
+  # MODEL - SAM3-Small V2 with 16 ViT layers
   model:
     _target_: training.sam3_small.model_builder.build_sam3_small
     bpe_path: ${paths.bpe_path}
-    device: cpu  # Trainer moves to GPU
+    device: cpu
     eval_mode: false
     enable_segmentation: ${scratch.enable_segmentation}
 
@@ -272,11 +274,12 @@ trainer:
 
   optim:
     amp:
-      enabled: false
-      amp_dtype: float16  # Use float16 for consumer GPUs
+      enabled: true  # Use mixed precision for memory efficiency
+      amp_dtype: bfloat16
 
     optimizer:
       _target_: torch.optim.AdamW
+      _partial_: true
 
     gradient_clip:
       _target_: sam3.train.optim.optimizer.GradientClipper
@@ -330,27 +333,27 @@ trainer:
 
   checkpoint:
     save_dir: ${launcher.experiment_log_dir}/checkpoints
-    save_freq: 5  # Save every 5 epochs
+    save_freq: 2
 
   logging:
     tensorboard_writer:
       _target_: sam3.train.utils.logger.make_tensorboard_logger
       log_dir: ${launcher.experiment_log_dir}/tensorboard
       flush_secs: 120
-      should_log: true
     wandb_writer: null
     log_dir: ${launcher.experiment_log_dir}/logs
-    log_freq: 10
+    log_freq: 20
 
 # ============================================================================
 # Launcher Configuration
 # ============================================================================
 launcher:
   num_nodes: 1
-  gpus_per_node: 1           # Single GPU training
+  gpus_per_node: 1
   experiment_log_dir: ${paths.experiment_log_dir}
   multiprocessing_context: spawn
 
 submitit:
   use_cluster: false
   port_range: [10000, 65000]
+

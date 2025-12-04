@@ -95,10 +95,8 @@ dataset:
 # Scratch (Helper Parameters)
 # ============================================================================
 scratch:
-  # SAM3-Small V2: Full resolution, reduced layers!
-  # Same 1008 resolution for best detection quality
-  # 12 ViT layers instead of 32 for reduced compute
-  resolution: 1008  # FULL resolution (same as original SAM3)
+  # SAM3-Small specific
+  resolution: 252  # Our smaller resolution
   d_model: 256
   enable_segmentation: false  # Set true for mask training
 
@@ -109,10 +107,9 @@ scratch:
   val_norm_std: [0.5, 0.5, 0.5]
 
   # Training parameters for consumer GPU
-  # NOTE: Full resolution requires more VRAM - adjust batch size!
-  train_batch_size: 1        # Reduced for 1008x1008 images
+  train_batch_size: 2        # Increase if you have more VRAM
   val_batch_size: 1
-  gradient_accumulation_steps: 4  # Effective batch = 1*4 = 4
+  gradient_accumulation_steps: 1  # Effective batch = 2*4 = 8
   num_train_workers: 4
   num_val_workers: 2
   max_ann_per_img: 100       # Max objects per image
