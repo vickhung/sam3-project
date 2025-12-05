@@ -25,18 +25,45 @@ def multiply_all(*args):
 def collect_dict_keys(config):
     """This function recursively iterates through a dataset configuration, and collect all the dict_key that are defined"""
     val_keys = []
-    # If the this config points to the collate function, then it has a key
-    if "_target_" in config and re.match(r".*collate_fn.*", config["_target_"]):
-        val_keys.append(config["dict_key"])
-    else:
-        # Recursively proceed
-        for v in config.values():
-            if isinstance(v, type(config)):
-                val_keys.extend(collect_dict_keys(v))
-            elif isinstance(v, omegaconf.listconfig.ListConfig):
-                for item in v:
-                    if isinstance(item, type(config)):
-                        val_keys.extend(collect_dict_keys(item))
+    # Wrap everything in try-except to handle any case where config is already instantiated
+    try:
+        # First check: must be a dict/config type - do this in try-except in case isinstance fails
+        try:
+            is_dict_like = isinstance(config, (dict, omegaconf.DictConfig))
+        except (TypeError, AttributeError):
+            return val_keys
+        
+        if not is_dict_like:
+            return val_keys
+        
+        # Second check: must have dict-like methods
+        if not hasattr(config, 'get') or not hasattr(config, 'values'):
+            return val_keys
+        
+        # Try to check if it has _target_ - if this fails, it's likely already instantiated
+        try:
+            target = config.get("_target_", None)
+        except (TypeError, AttributeError):
+            return val_keys
+        
+        # If the this config points to the collate function, then it has a key
+        if target and re.match(r".*collate_fn.*", str(target)):
+            val_keys.append(config.get("dict_key", None))
+        else:
+            # Recursively proceed - wrap in try-except for safety
+            try:
+                for v in config.values():
+                    if isinstance(v, (dict, omegaconf.DictConfig)):
+                        val_keys.extend(collect_dict_keys(v))
+                    elif isinstance(v, omegaconf.listconfig.ListConfig):
+                        for item in v:
+                            if isinstance(item, (dict, omegaconf.DictConfig)):
+                                val_keys.extend(collect_dict_keys(item))
+            except (TypeError, AttributeError, ValueError):
+                pass  # Skip if values() fails
+    except (TypeError, AttributeError, ValueError) as e:
+        # If anything goes wrong, return empty list (config is likely already instantiated)
+        return val_keys
     return val_keys
 
 
@@ -71,7 +98,10 @@ def setup_distributed_backend(backend, timeout_mins):
     # of waiting
     os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "1"
     logging.info(f"Setting up torch.distributed with a timeout of {timeout_mins} mins")
-    dist.init_process_group(backend=backend, timeout=timedelta(minutes=timeout_mins))
+    if not dist.is_initialized():
+        dist.init_process_group(backend=backend, timeout=timedelta(minutes=timeout_mins))
+    else:
+        logging.info("Process group already initialized, skipping")
     return dist.get_rank()
 
 

@@ -2,110 +2,157 @@
 """
 Train SAM3-Small V2 on COCO dataset.
 
+This script follows the original Meta SAM3 training pattern exactly.
 Usage:
-    # Single GPU training:
-    torchrun --nproc_per_node=1 train_sam3_small_coco.py
+    # With torchrun (recommended):
+    torchrun --nproc_per_node=1 train_sam3_small_coco.py -c training/configs/sam3_small_coco.yaml
     
-    # Or for quick test without distributed:
-    python train_sam3_small_coco.py --single-gpu
-
-This script trains the SAM3-Small model (16 ViT layers, full 1008 resolution)
-on COCO val2017 (5K images, 80 categories).
+    # Or single GPU without torchrun:
+    python train_sam3_small_coco.py -c training/configs/sam3_small_coco.yaml --use-cluster 0 --num-gpus 1
 """
 
 import os
 import sys
-import argparse
+import logging
+from argparse import ArgumentParser
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# Set environment variable for full Hydra errors
+os.environ["HYDRA_FULL_ERROR"] = "1"
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--single-gpu", action="store_true", 
-                       help="Run without torchrun (single GPU)")
-    args = parser.parse_args()
+from hydra import compose, initialize_config_dir
+from hydra.utils import instantiate
+from omegaconf import OmegaConf
+from iopath.common.file_io import g_pathmgr
+
+from sam3.train.utils.train_utils import makedir, register_omegaconf_resolvers
+
+
+def single_proc_run(local_rank, main_port, cfg, world_size):
+    """Single GPU process - matches original Meta pattern"""
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(main_port)
+    os.environ["RANK"] = str(local_rank)
+    os.environ["LOCAL_RANK"] = str(local_rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
     
+    try:
+        register_omegaconf_resolvers()
+    except Exception as e:
+        logging.info(e)
+
+    # Instantiate trainer with _recursive_=False as in original
+    trainer = instantiate(cfg.trainer, _recursive_=False)
+    trainer.run()
+
+
+def single_node_runner(cfg, main_port: int):
+    """Single node runner - matches original Meta pattern"""
+    import torch.multiprocessing as mp
+    
+    assert cfg.launcher.num_nodes == 1
+    num_proc = cfg.launcher.gpus_per_node
+    torch = __import__('torch')
+    torch.multiprocessing.set_start_method("spawn")  # CUDA runtime does not support `fork`
+    
+    if num_proc == 1:
+        # directly call single_proc so we can easily set breakpoints
+        single_proc_run(local_rank=0, main_port=main_port, cfg=cfg, world_size=num_proc)
+    else:
+        mp_runner = torch.multiprocessing.start_processes
+        args = (main_port, cfg, num_proc)
+        mp_runner(single_proc_run, args=args, nprocs=num_proc, start_method="spawn")
+
+
+def main(args) -> None:
+    """Main function - matches original Meta pattern"""
+    import random
     import torch
     
-    # Set environment for single GPU if not using torchrun
-    if args.single_gpu or "RANK" not in os.environ:
-        os.environ.setdefault("RANK", "0")
-        os.environ.setdefault("WORLD_SIZE", "1")
-        os.environ.setdefault("LOCAL_RANK", "0")
-        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-        os.environ.setdefault("MASTER_PORT", "29500")
+    # Config path - use config_dir approach since we're not using config_module
+    config_dir = os.path.join(os.path.dirname(__file__), "training", "configs")
+    config_name = args.config.replace(".yaml", "").replace("training/configs/", "").replace("configs/", "")
     
-    rank = int(os.environ.get("RANK", 0))
-    
-    if rank == 0:
-        print("=" * 70)
-        print("SAM3-Small V2 Training on COCO")
-        print("=" * 70)
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-        print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-        print()
-    
-    # Import hydra and run training
-    from hydra import initialize_config_dir, compose
-    from omegaconf import OmegaConf
-    from hydra.utils import instantiate
-    
-    # Config path
-    config_dir = os.path.join(os.path.dirname(__file__), "training/configs")
-    config_name = "sam3_small_coco"
-    
-    if rank == 0:
-        print(f"Config: {config_dir}/{config_name}.yaml")
-        print()
-    
-    # Initialize hydra
+    # Initialize hydra and load config
     with initialize_config_dir(config_dir=os.path.abspath(config_dir), version_base=None):
         cfg = compose(config_name=config_name)
     
-    if rank == 0:
-        # Print key settings
-        print("Training Configuration:")
-        print(f"  Dataset: COCO val2017")
-        print(f"  Resolution: {cfg.scratch.resolution}")
-        print(f"  Batch size: {cfg.scratch.train_batch_size} × {cfg.scratch.gradient_accumulation_steps} = {cfg.scratch.train_batch_size * cfg.scratch.gradient_accumulation_steps} effective")
-        print(f"  Epochs: {cfg.trainer.max_epochs}")
-        print(f"  AMP: {cfg.trainer.optim.amp.enabled} ({cfg.trainer.optim.amp.amp_dtype})")
-        print(f"  Output: {cfg.launcher.experiment_log_dir}")
-        print()
-        
-        # Create output directory
-        os.makedirs(cfg.launcher.experiment_log_dir, exist_ok=True)
-        
-        # Save resolved config
-        config_path = os.path.join(cfg.launcher.experiment_log_dir, "config_resolved.yaml")
-        with open(config_path, "w") as f:
-            OmegaConf.save(cfg, f)
-        print(f"Config saved to: {config_path}")
-        print()
+    if cfg.launcher.experiment_log_dir is None:
+        cfg.launcher.experiment_log_dir = os.path.join(
+            os.getcwd(), "sam3_logs", config_name
+        )
     
-    # Instantiate trainer
-    if rank == 0:
-        print("Initializing trainer...")
-    trainer = instantiate(cfg.trainer)
+    print("###################### Train App Config ####################")
+    print(OmegaConf.to_yaml(cfg))
+    print("############################################################")
+
+    makedir(cfg.launcher.experiment_log_dir)
+    with g_pathmgr.open(
+        os.path.join(cfg.launcher.experiment_log_dir, "config.yaml"), "w"
+    ) as f:
+        f.write(OmegaConf.to_yaml(cfg))
+
+    cfg_resolved = OmegaConf.to_container(cfg, resolve=False)
+    cfg_resolved = OmegaConf.create(cfg_resolved)
+
+    with g_pathmgr.open(
+        os.path.join(cfg.launcher.experiment_log_dir, "config_resolved.yaml"), "w"
+    ) as f:
+        f.write(OmegaConf.to_yaml(cfg_resolved, resolve=True))
+
+    submitit_conf = cfg.get("submitit", None)
+    assert submitit_conf is not None, "Missing submitit config"
+
+    experiment_log_dir = cfg.launcher.experiment_log_dir
+    print(f"Experiment Log Dir:\n{experiment_log_dir}")
+
+    # Prioritize cmd line args
+    cfg.launcher.gpus_per_node = (
+        args.num_gpus if args.num_gpus is not None else cfg.launcher.gpus_per_node
+    )
+    cfg.launcher.num_nodes = (
+        args.num_nodes if args.num_nodes is not None else cfg.launcher.num_nodes
+    )
+    submitit_conf.use_cluster = (
+        args.use_cluster if args.use_cluster is not None else submitit_conf.use_cluster
+    )
     
-    if rank == 0:
-        print()
-        print("=" * 70)
-        print("Starting training...")
-        print("=" * 70)
-    
-    # Run training
-    trainer.train()
-    
-    if rank == 0:
-        print()
-        print("=" * 70)
-        print("Training complete!")
-        print("=" * 70)
+    if submitit_conf.use_cluster:
+        # Cluster execution not implemented in this simplified version
+        raise NotImplementedError("Cluster execution not supported in this script. Use original train.py for cluster support.")
+    else:
+        cfg.launcher.num_nodes = 1
+        main_port = random.randint(
+            submitit_conf.port_range[0], submitit_conf.port_range[1]
+        )
+        single_node_runner(cfg, main_port)
 
 
 if __name__ == "__main__":
-    main()
-
+    parser = ArgumentParser()
+    parser.add_argument(
+        "-c",
+        "--config",
+        required=True,
+        type=str,
+        help="path to config file (e.g. training/configs/sam3_small_coco.yaml)",
+    )
+    parser.add_argument(
+        "--use-cluster",
+        type=int,
+        default=None,
+        help="whether to launch on a cluster, 0: run locally, 1: run on a cluster",
+    )
+    parser.add_argument("--partition", type=str, default=None, help="SLURM partition")
+    parser.add_argument("--account", type=str, default=None, help="SLURM account")
+    parser.add_argument("--qos", type=str, default=None, help="SLURM qos")
+    parser.add_argument(
+        "--num-gpus", type=int, default=None, help="number of GPUS per node"
+    )
+    parser.add_argument("--num-nodes", type=int, default=None, help="Number of nodes")
+    args = parser.parse_args()
+    args.use_cluster = bool(args.use_cluster) if args.use_cluster is not None else None
+    register_omegaconf_resolvers()
+    main(args)

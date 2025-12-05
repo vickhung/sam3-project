@@ -152,8 +152,24 @@ class Logger:
     def __init__(self, logging_conf):
         # allow turning off TensorBoard with "should_log: false" in config
         tb_config = logging_conf.tensorboard_writer
-        tb_should_log = tb_config and tb_config.pop("should_log", True)
-        self.tb_logger = instantiate(tb_config) if tb_should_log else None
+        if tb_config is None:
+            self.tb_logger = None
+        else:
+            # Handle both dict and DictConfig
+            if isinstance(tb_config, dict):
+                tb_should_log = tb_config.pop("should_log", True)
+            else:
+                # DictConfig or other - get should_log and create a copy without it
+                tb_should_log = tb_config.get("should_log", True) if hasattr(tb_config, "get") else True
+                if hasattr(tb_config, "__dict__") or hasattr(tb_config, "_content"):
+                    # Create a new dict/config without should_log for instantiation
+                    import omegaconf
+                    if isinstance(tb_config, omegaconf.DictConfig):
+                        tb_config = omegaconf.OmegaConf.create({k: v for k, v in tb_config.items() if k != "should_log"})
+                    else:
+                        # Regular dict-like, create dict without should_log
+                        tb_config = {k: v for k, v in tb_config.items() if k != "should_log"}
+            self.tb_logger = instantiate(tb_config) if tb_should_log else None
 
     def log_dict(self, payload: Dict[str, Scalar], step: int) -> None:
         if self.tb_logger:

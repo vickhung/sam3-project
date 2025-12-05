@@ -13,9 +13,9 @@ defaults:
 # Paths
 # ============================================================================
 paths:
-  dataset_root: /home/vkwk/cursor/linux setup/sam3-project/data/coco
-  experiment_log_dir: /home/vkwk/cursor/linux setup/sam3-project/experiments/sam3_small_coco
-  bpe_path: /home/vkwk/cursor/linux setup/sam3-project/sam3/assets/bpe_simple_vocab_16e6.txt.gz
+  dataset_root: /home/bu10d2/vk/sam3-project/data/coco
+  experiment_log_dir: /home/bu10d2/vk/sam3-project/experiments/sam3_small_coco
+  bpe_path: /home/bu10d2/vk/sam3-project/sam3/assets/bpe_simple_vocab_16e6.txt.gz
 
 # ============================================================================
 # Dataset Configuration  
@@ -104,7 +104,7 @@ dataset:
 # ============================================================================
 scratch:
   # SAM3-Small V2: Full resolution, 16 ViT layers
-  resolution: 1008
+  resolution: 672
   d_model: 256
   enable_segmentation: false  # Start with detection only
 
@@ -114,10 +114,10 @@ scratch:
   val_norm_mean: [0.5, 0.5, 0.5]
   val_norm_std: [0.5, 0.5, 0.5]
 
-  # Training parameters - optimized for 8GB GPU
+  # Training parameters - start with single batch
   train_batch_size: 1
   val_batch_size: 1
-  gradient_accumulation_steps: 8  # Effective batch = 8
+  gradient_accumulation_steps: 1  # Start with 1, can increase later
   num_train_workers: 4
   num_val_workers: 2
   max_ann_per_img: 100
@@ -185,7 +185,7 @@ trainer:
   skip_saving_ckpts: false
   empty_gpu_mem_cache_after_eval: true
   skip_first_val: false
-  max_epochs: 20  # Quick training run
+  max_epochs: 50  # Full training run
   accelerator: cuda
   seed_value: 42
   val_epoch_freq: 2
@@ -279,7 +279,6 @@ trainer:
 
     optimizer:
       _target_: torch.optim.AdamW
-      _partial_: true
 
     gradient_clip:
       _target_: sam3.train.optim.optimizer.GradientClipper

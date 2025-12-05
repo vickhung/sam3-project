@@ -17,6 +17,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import omegaconf
 from hydra.utils import instantiate
 from iopath.common.file_io import g_pathmgr
 
@@ -576,10 +577,14 @@ class Trainer:
         self.val_dataset = None
 
         if self.mode in ["train", "val"]:
-            self.val_dataset = instantiate(self.data_conf.get(Phase.VAL, None))
+            val_data_conf = self.data_conf.get(Phase.VAL, None)
+            if val_data_conf is not None:
+                self.val_dataset = instantiate(val_data_conf)
 
         if self.mode in ["train", "train_only"]:
-            self.train_dataset = instantiate(self.data_conf.train)
+            train_data_conf = self.data_conf.train
+            if train_data_conf is not None:
+                self.train_dataset = instantiate(train_data_conf)
 
     def run_train(self):
         while self.epoch < self.max_epochs:
@@ -1093,12 +1098,15 @@ class Trainer:
             enabled=self.optim_conf.amp.enabled if self.optim_conf else False,
         )
 
-        self.gradient_clipper = (
-            instantiate(self.optim_conf.gradient_clip) if self.optim_conf else None
-        )
-        self.gradient_logger = (
-            instantiate(self.optim_conf.gradient_logger) if self.optim_conf else None
-        )
+        if self.optim_conf and self.optim_conf.gradient_clip:
+            self.gradient_clipper = instantiate(self.optim_conf.gradient_clip)
+        else:
+            self.gradient_clipper = None
+        
+        if self.optim_conf and self.optim_conf.gradient_logger:
+            self.gradient_logger = instantiate(self.optim_conf.gradient_logger)
+        else:
+            self.gradient_logger = None
 
         logging.info("Finished setting up components: Model, loss, optim, meters etc.")
 
